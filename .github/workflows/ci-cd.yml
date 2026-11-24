@@ -1,45 +1,347 @@
 
-name: Build and Deploy Application
+name: DevSecOps CI/CD Pipeline
 
 on:
   push:
     branches:
       - main
+      - development
+
+  pull_request:
+    branches:
+      - main
+      - development
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: two-tear-app
 
 jobs:
-  deploy:
+
+  # ==========================================
+  # 1. CODE QUALITY AND PYTHON TESTING
+  # ==========================================
+
+  code-quality:
+    name: Code Quality and Tests
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Python Syntax Check
+        run: |
+          python -m compileall -q .
+
+      - name: Run Unit Tests
+        run: |
+          if find . -type f \( -name 'test_*.py' -o -name '*_test.py' \) \
+            -not -path './.venv/*' \
+            -not -path './venv/*' | grep -q .; then
+            python -m pytest -q
+          else
+            echo "No Python tests found. Test execution skipped."
+          fi
+
+  # ==========================================
+  # 2. SECRET DETECTION
+  # ==========================================
+
+  secret-scan:
+    name: Gitleaks Secret Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Full History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for Secrets
+        uses: gitleaks/gitleaks-action@v2
+
+  # ==========================================
+  # 3. STATIC APPLICATION SECURITY TESTING
+  # ==========================================
+
+  sast:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: p/default
+
+  # ==========================================
+  # 4. FILESYSTEM VULNERABILITY SCAN
+  # ==========================================
+
+  filesystem-scan:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ==========================================
+  # 5. DOCKER BUILD AND IMAGE SECURITY SCAN
+  # ==========================================
+
+  docker-build:
+    name: Build and Scan Docker Image
+    runs-on: ubuntu-latest
+
+    needs:
+      - code-quality
+      - secret-scan
+      - sast
+      - filesystem-scan
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build Docker Image
         run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/myapp:latest .
+          docker build \
+            --pull \
+            -t "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
+            .
+
+      - name: Scan Docker Image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/two-tear-app:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tag Docker Image
+        run: |
+          docker tag \
+            "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
+            "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest"
 
       - name: Push Docker Image
         run: |
-          docker push ${{ secrets.DOCKER_USERNAME }}/myapp:latest
+          docker push "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker push "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest"
 
-      - name: Deploy to Ubuntu Server
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            docker pull ${{ secrets.DOCKER_USERNAME }}/myapp:latest
-            docker stop myapp || true
-            docker rm myapp || true
-            docker run -d \
-              --name myapp \
-              --restart unless-stopped \
-              -p 80:5000 \
-              ${{ secrets.DOCKER_USERNAME }}/myapp:latest
+  # ==========================================
+  # 6. PRODUCTION DEPLOYMENT
+  # ==========================================
+
+  deploy:
+    name: Deploy to Ubuntu Production Server
+    runs-on: ubuntu-latest
+
+    needs:
+      - docker-build
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Deployment Configuration
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -eu
+
+          for name in SSH_HOST SSH_USER SSH_PRIVATE_KEY \
+            SSH_KNOWN_HOSTS SSH_PORT DEPLOY_PATH \
+            HEALTHCHECK_URL DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required secret: $name"
+              exit 1
+            fi
+          done
+
+          echo "Deployment configuration validated."
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy Docker Image
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -eu
+
+          IMAGE="$DOCKERHUB_USERNAME/$IMAGE_NAME"
+
+          # Transfer Docker Hub authentication over SSH stdin
+          printf '%s' "$DOCKERHUB_TOKEN" | ssh \
+            -i ~/.ssh/deploy_key \
+            -p "$SSH_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            "$SSH_USER@$SSH_HOST" \
+            "docker login -u '$DOCKERHUB_USERNAME' --password-stdin"
+
+          # Deploy the exact image built by this workflow
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -p "$SSH_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            "$SSH_USER@$SSH_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' \
+             IMAGE_NAME='$IMAGE' \
+             IMAGE_TAG='$IMAGE_TAG' \
+             HEALTHCHECK_URL='$HEALTHCHECK_URL' \
+             bash -s" <<'REMOTE_SCRIPT'
+
+          set -eu
+
+          cd "$DEPLOY_PATH"
+
+          if [ ! -f docker-compose.yml ] && [ ! -f compose.yaml ] && [ ! -f compose.yml ]; then
+            echo "Docker Compose file not found in deployment directory."
+            exit 1
+          fi
+
+          PREVIOUS_TAG=""
+          if [ -f .last_image_tag ]; then
+            PREVIOUS_TAG=$(cat .last_image_tag)
+          fi
+
+          export IMAGE_NAME IMAGE_TAG
+
+          echo "Pulling new Docker image..."
+          docker compose pull
+
+          echo "Starting new deployment..."
+          docker compose up -d --remove-orphans
+
+          echo "Waiting for application health..."
+
+          HEALTHY=0
+
+          for i in $(seq 1 12); do
+            if curl -fsS --max-time 5 "$HEALTHCHECK_URL" >/dev/null; then
+              HEALTHY=1
+              break
+            fi
+
+            sleep 5
+          done
+
+          if [ "$HEALTHY" -eq 1 ]; then
+            echo "$IMAGE_TAG" > .last_image_tag
+            echo "Deployment successful."
+            exit 0
+          fi
+
+          echo "Health check failed. Starting rollback..."
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            export IMAGE_TAG="$PREVIOUS_TAG"
+
+            if docker compose pull && docker compose up -d --remove-orphans; then
+              echo "Previous application version restored."
+            else
+              echo "WARNING: Automatic rollback failed."
+            fi
+          else
+            echo "No previous deployment tag available for rollback."
+          fi
+
+          exit 1
+
+          REMOTE_SCRIPT
+
+      - name: Cleanup SSH Credentials
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+          rm -f ~/.ssh/known_hosts
+
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "## Production Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: ${{ secrets.DOCKERHUB_USERNAME }}/two-tear-app" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
