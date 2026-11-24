@@ -1,32 +1,11 @@
 
-name: Simple Docker CI/CD
-
-on:
-  push:
-    branches:
-      - main
-
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  docker-build-run:
-    name: Build and Run Docker
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      
 name: Docker Build and Run
 
 on:
   push:
     branches:
       - main
+
   workflow_dispatch:
 
 permissions:
@@ -34,6 +13,7 @@ permissions:
 
 jobs:
   docker:
+    name: Build and Test Docker
     runs-on: ubuntu-latest
 
     steps:
@@ -44,6 +24,10 @@ jobs:
         run: |
           docker build -t two-tier-app:latest .
 
+      - name: Remove Existing Container
+        run: |
+          docker rm -f two-tier-app || true
+
       - name: Run Docker Container
         run: |
           docker run -d \
@@ -51,13 +35,30 @@ jobs:
             -p 5000:5000 \
             two-tier-app:latest
 
-      - name: Check Container
+      - name: Wait for Application
+        run: sleep 10
+
+      - name: Check Container Status
         run: |
-          docker ps
+          docker ps -a
           docker logs two-tier-app
 
       - name: Test Application
         run: |
-          sleep 5
-          curl --fail http://localhost:5000
+          for i in {1..10}; do
+            if curl -fsS http://localhost:5000; then
+              echo "Application is running successfully!"
+              exit 0
+            fi
+            echo "Waiting for application..."
+            sleep 5
+          done
 
+          echo "Application health check failed!"
+          docker logs two-tier-app
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f two-tier-app || true
