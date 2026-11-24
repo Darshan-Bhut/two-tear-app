@@ -168,7 +168,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5730f6571df03bcee54fd91f921cf66c2d3d09f # v3.10.0
+        uses: docker/setup-buildx-action@v6 # v3.10.0
 
       # ── Log in to Docker Hub ──────────────────────────────────────────────
       - name: Log in to Docker Hub
@@ -183,7 +183,7 @@ jobs:
       #   <username>/two-tier-flask-app:<short-git-sha>  ← used for deploy
       - name: Generate image tags and labels
         id: meta
-        uses: docker/metadata-action@902fa8ec7d6ecbea8a71e2ab9e35ec42fca1a3f6 # v5.7.0
+        uses: docker/metadata-action@v6 # v5.7.0
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
