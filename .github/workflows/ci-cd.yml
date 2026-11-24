@@ -2,13 +2,14 @@ name: CI/CD – Test, Scan, Build & Deploy
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runs on every push and every Pull Request targeting main.
-# Four jobs run in order:
+# Five jobs run in order:
 #
-#   1. code-review  → lint (flake8) + unit tests (pytest)
-#   2. security     → dependency audit (pip-audit) + secret scan (gitleaks)
+#   1. dependencies → install + cache Python packages once for all jobs
+#   2. code-review  → lint (flake8) + unit tests (pytest)
+#   3. security     → dependency audit (pip-audit) + secret scan (gitleaks)
 #                     + Docker image vulnerability scan (trivy)
-#   3. docker       → build image and push to Docker Hub   [main only]
-#   4. deploy       → SSH into server, pull new image, restart containers
+#   4. docker       → build image and push to Docker Hub   [main only]
+#   5. deploy       → SSH into server, pull new image, restart containers
 #
 # Required secrets – Settings → Environments → production → Environment secrets:
 #
@@ -41,12 +42,16 @@ env:
 
 jobs:
 # ═══════════════════════════════════════════════════════════════════════════════
-# JOB 1 – CODE REVIEW: lint + unit tests
-# Runs on every push and every PR.
-# Catches syntax errors, bad style, and broken logic before anything else.
+# JOB 1 – DEPENDENCIES: install and cache Python packages
+# Runs first, once. Every other job that needs Python packages restores
+# this cache instead of re-downloading from PyPI.
+#
+# Cache key = "pip-<hash of requirements-dev.txt>".
+# If requirements-dev.txt hasn't changed the cache hits and pip install
+# takes ~1 second instead of ~30 seconds on every job.
 # ═══════════════════════════════════════════════════════════════════════════════
-  code-review:
-    name: "Code Review (lint + tests)"
+  dependencies:
+    name: "Install & Cache Dependencies"
     runs-on: ubuntu-latest
 
     steps:
@@ -57,9 +62,50 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
-          cache: pip
+          cache: pip                        # built-in pip cache keyed on requirements files
 
-      - name: Install dependencies
+      # Install everything needed by all downstream jobs in one shot.
+      # requirements-dev.txt already includes -r requirements.txt so both
+      # production and dev packages are cached together.
+      - name: Install all Python dependencies
+        run: pip install -r requirements-dev.txt flake8 pip-audit
+
+      # ── Verify the lock is consistent ─────────────────────────────────────
+      # pip check catches dependency conflicts: e.g. package A requires
+      # package B>=2.0 but requirements.txt pins B==1.5.
+      - name: Check for dependency conflicts (pip check)
+        run: pip check
+
+      # ── Show the full resolved dependency tree ────────────────────────────
+      # pipdeptree prints every package and what it depends on.
+      # This runs in the log so you can see exactly what versions were
+      # installed — useful when debugging a CVE or a version conflict.
+      - name: Print dependency tree (pipdeptree)
+        run: |
+          pip install pipdeptree --quiet
+          pipdeptree
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 2 – CODE REVIEW: lint + unit tests
+# Runs after dependencies. Restores the pip cache — no re-download needed.
+# Catches syntax errors, bad style, and broken logic before anything else.
+# ═══════════════════════════════════════════════════════════════════════════════
+  code-review:
+    name: "Code Review (lint + tests)"
+    runs-on: ubuntu-latest
+    needs: dependencies               # wait for cache to be populated
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+          cache: pip                        # restores the cache built in job 1
+
+      - name: Install dependencies (from cache)
         run: pip install -r requirements-dev.txt flake8
 
       # ── Lint ──────────────────────────────────────────────────────────────
@@ -80,8 +126,9 @@ jobs:
         run: pytest tests/ -v --tb=short
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# JOB 2 – SECURITY: dependency audit + secret scan + image scan
-# Runs after code-review passes. Three independent scanners:
+# JOB 3 – SECURITY: dependency audit + secret scan + image scan
+# Runs after code-review passes. Restores pip cache for pip-audit.
+# Three independent scanners:
 #   - pip-audit   → known CVEs in Python packages
 #   - gitleaks    → secrets accidentally committed to git history
 #   - trivy       → OS + package vulnerabilities inside the Docker image
@@ -101,15 +148,16 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
-          cache: pip
+          cache: pip                        # restores cache from job 1
+
+      - name: Install dependencies (from cache)
+        run: pip install -r requirements-dev.txt pip-audit
 
       # ── Dependency vulnerability audit ────────────────────────────────────
       # pip-audit checks every package in requirements.txt against the OSV
-      # and PyPI advisory databases.
+      # and PyPI advisory databases. pip-audit is already installed from cache.
       - name: Audit Python dependencies (pip-audit)
-        run: |
-          pip install pip-audit
-          pip-audit -r requirements.txt --progress-spinner off
+        run: pip-audit -r requirements.txt --progress-spinner off
 
       # ── Secret scan ───────────────────────────────────────────────────────
       # gitleaks scans the full git history for accidentally committed secrets:
@@ -149,7 +197,7 @@ jobs:
           ignore-unfixed: true   # skip CVEs that have no fix yet
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# JOB 3 – DOCKER: build final image and push to Docker Hub
+# JOB 4 – DOCKER: build final image and push to Docker Hub
 # Only runs on pushes to main (not on PRs — PRs only test).
 # Tags the image with both the git SHA (immutable) and "latest".
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -168,14 +216,14 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3 # v3.10.0
+        uses: docker/setup-buildx-action@b5730f6571df03bcee54fd91f921cf66c2d3d09f # v3.10.0
 
       # ── Log in to Docker Hub ──────────────────────────────────────────────
       - name: Log in to Docker Hub
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
       # ── Generate image tags ───────────────────────────────────────────────
       # Creates two tags automatically:
@@ -183,7 +231,7 @@ jobs:
       #   <username>/two-tier-flask-app:<short-git-sha>  ← used for deploy
       - name: Generate image tags and labels
         id: meta
-        uses: docker/metadata-action@v6 # v5.7.0
+        uses: docker/metadata-action@902fa8ec7d6ecbea8a71e2ab9e35ec42fca1a3f6 # v5.7.0
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
@@ -202,7 +250,7 @@ jobs:
           cache-to: type=gha,mode=max
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# JOB 4 – DEPLOY: SSH into server, pull new image, restart containers
+# JOB 5 – DEPLOY: SSH into server, pull new image, restart containers
 # Only runs after the docker job succeeds.
 # No registry-less build here — the server pulls the pre-built image from
 # Docker Hub and restarts via docker compose.
