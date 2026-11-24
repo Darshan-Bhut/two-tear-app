@@ -20,6 +20,26 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      
+name: Docker Build and Run
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
       - name: Build Docker Image
         run: |
           docker build -t two-tier-app:latest .
@@ -31,14 +51,13 @@ jobs:
             -p 5000:5000 \
             two-tier-app:latest
 
-      - name: Verify Container
+      - name: Check Container
         run: |
           docker ps
           docker logs two-tier-app
 
-      - name: Test Container
+      - name: Test Application
         run: |
           sleep 5
-          docker inspect \
-            --format='{{.State.Status}}' \
-            two-tier-app
+          curl --fail http://localhost:5000
+
