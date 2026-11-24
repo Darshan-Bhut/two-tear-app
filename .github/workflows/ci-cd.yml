@@ -228,7 +228,7 @@ jobs:
       # ── Generate image tags ───────────────────────────────────────────────
       # Creates two tags automatically:
       #   <username>/two-tier-flask-app:latest
-      #   <username>/two-tier-flask-app:<short-git-sha>  ← used for deploy
+     #   <username>/two-tier-flask-app:<short-git-sha>  ← used for deploy
       - name: Generate image tags and labels
         id: meta
         uses: docker/metadata-action@902fa8ec7d6ecbea8a71e2ab9e35ec42fca1a3f6 # v5.7.0
