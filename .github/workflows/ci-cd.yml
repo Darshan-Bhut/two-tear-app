@@ -224,20 +224,18 @@ jobs:
       # Generates two tags from the git context automatically:
       #   <username>/two-tier-flask-app:latest
       #   <username>/two-tier-flask-app:a3f9c12  (short SHA)
-      - name: Generate image tags and labels
+      - name: Extract Docker metadata (tags & labels)
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,prefix=,format=short
+          images: two-tier-flask-app   # No leading slash or empty variable
 
-      - name: Build and push to Docker Hub
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      - name: Build Docker image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
-          push: true
+          load: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
