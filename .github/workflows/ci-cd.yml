@@ -180,7 +180,7 @@ jobs:
       # HIGH findings are printed but do not block (remove "|| true" to block).
       # ignore-unfixed skips CVEs that have no patch available yet.
       - name: Scan Docker image for CVEs (trivy)
-        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # v0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0 # v0.36.0
         with:
           image-ref: scan-target:latest
           format: table
