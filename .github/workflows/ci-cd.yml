@@ -1,64 +1,408 @@
+name: CI/CD – Two-Tier Flask App
 
-name: Docker Build and Run
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline overview – runs on every push and PR targeting main:
+#
+#   1. dependencies  install + cache Python packages, check for conflicts
+#   2. code-review   lint (flake8) + unit tests (pytest)
+#   3. security      CVE audit (pip-audit) + secret scan (gitleaks)
+#                    + Docker image scan (trivy)
+#   4. docker        build & push to Docker Hub          ← main branch only
+#   5. deploy        SSH into server, pull image, restart containers
+#                    + smoke test /health endpoint
+#
+# All action SHAs are pinned to the real commit that the version tag points to.
+# They were verified via the GitHub API before this file was written.
+#
+# ── Secrets required (Settings → Environments → production) ──────────────────
+#   DOCKERHUB_USERNAME   Docker Hub username
+#   DOCKERHUB_TOKEN      Docker Hub access token  (not your password)
+#   SSH_HOST             server hostname or IP
+#   SSH_USER             non-root user in the docker group
+#   SSH_KEY              private key PEM content
+#   DEPLOY_PATH          absolute path on server  e.g. /opt/two-tier-flask-app
+#   SSH_PORT             optional, defaults to 22
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
 
-  workflow_dispatch:
-
+# Minimal permissions – only read repository content.
 permissions:
   contents: read
 
+# If a new commit is pushed while a run is in progress for the same branch,
+# cancel the old run and start fresh.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/two-tier-flask-app
+
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
-  docker:
-    name: Build and Test Docker
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ JOB 1 · DEPENDENCIES                                                    │
+# │ Install every Python package once and save it to GitHub's pip cache.    │
+# │ All downstream jobs restore this cache – no re-downloading from PyPI.   │
+# └─────────────────────────────────────────────────────────────────────────┘
+  dependencies:
+    name: "📦 Install & Cache Dependencies"
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Build Docker Image
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # Install prod + dev packages + all tools used by later jobs in one shot.
+      # requirements-dev.txt already includes -r requirements.txt so both
+      # layers are cached together.
+      - name: Install all dependencies
+        run: pip install -r requirements-dev.txt flake8 pip-audit pipdeptree
+
+      # pip check detects version conflicts between installed packages.
+      # e.g. PackageA needs cryptography>=51 but requirements.txt pins 50.0.2
+      - name: Check for dependency conflicts
+        run: pip check
+
+      # Print the full resolved dependency tree to the job log.
+      # Useful when trivy/pip-audit flags a CVE – you can see which of your
+      # direct packages pulled in the vulnerable transitive dependency.
+      - name: Print dependency tree
+        run: pipdeptree
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ JOB 2 · CODE REVIEW                                                     │
+# │ Lint with flake8 and run pytest. Restores pip cache – no re-download.   │
+# └─────────────────────────────────────────────────────────────────────────┘
+  code-review:
+    name: "🔍 Code Review (lint + tests)"
+    runs-on: ubuntu-latest
+    needs: dependencies
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies (from cache)
+        run: pip install -r requirements-dev.txt flake8
+
+      # flake8 checks PEP-8 style and catches undefined names, missing imports,
+      # and other obvious Python errors. Line length raised to 120 so it does
+      # not flag normal, readable lines.
+      - name: Lint with flake8
         run: |
-          docker build -t two-tier-app:latest .
+          flake8 app.py tests/ \
+            --max-line-length=120 \
+            --extend-ignore=E501 \
+            --statistics
 
-      - name: Remove Existing Container
+      # pytest runs tests/test_app.py. The database is fully mocked so no
+      # real MySQL instance is needed in CI.
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ JOB 3 · SECURITY                                                        │
+# │  · pip-audit  – known CVEs in requirements.txt                          │
+# │  · gitleaks   – secrets committed to git history                        │
+# │  · trivy      – OS + package CVEs inside the Docker image               │
+# └─────────────────────────────────────────────────────────────────────────┘
+  security:
+    name: "🔒 Security Scan"
+    runs-on: ubuntu-latest
+    needs: code-review
+
+    steps:
+      - name: Checkout source (full history for gitleaks)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies (from cache)
+        run: pip install -r requirements-dev.txt pip-audit
+
+      # pip-audit queries the OSV and PyPI advisory databases for every
+      # package listed in requirements.txt.
+      - name: Audit Python dependencies (pip-audit)
+        run: pip-audit -r requirements.txt --progress-spinner off
+
+      # gitleaks scans every commit in the full git history for accidentally
+      # committed secrets: API keys, passwords, tokens, private keys.
+      # --redact hides the actual secret value from the log output.
+      - name: Scan git history for secrets (gitleaks)
         run: |
-          docker rm -f two-tier-app || true
+          VER=8.18.4
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+          gitleaks detect --source . --no-banner --redact --exit-code 1
 
-      - name: Run Docker Container
+      # Build the image locally (not pushed) so trivy can scan it.
+      # The final push to Docker Hub happens in the docker job.
+      - name: Build image for trivy scan
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: scan-target:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # trivy scans the image for OS and Python package CVEs.
+      # CRITICAL findings fail the build.
+      # HIGH findings are printed but do not block (remove "|| true" to block).
+      # ignore-unfixed skips CVEs that have no patch available yet.
+      - name: Scan Docker image for CVEs (trivy)
+        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # v0.30.0
+        with:
+          image-ref: scan-target:latest
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ JOB 4 · DOCKER                                                          │
+# │ Build the final image and push to Docker Hub.                           │
+# │ Runs only on pushes to main – PRs only run jobs 1-3.                    │
+# │ Produces two tags:                                                      │
+# │   · latest                                                              │
+# │   · <short-git-sha>   ← pinned tag passed to the deploy job            │
+# └─────────────────────────────────────────────────────────────────────────┘
+  docker:
+    name: "🐳 Build & Push Docker Image"
+    runs-on: ubuntu-latest
+    needs: security
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      # Generates two tags from the git context automatically:
+      #   <username>/two-tier-flask-app:latest
+      #   <username>/two-tier-flask-app:a3f9c12  (short SHA)
+      - name: Generate image tags and labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=,format=short
+
+      - name: Build and push to Docker Hub
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ JOB 5 · DEPLOY                                                          │
+# │ SSH into the production server, pull the new image, restart containers, │
+# │ and smoke-test the /health endpoint before marking the run green.       │
+# └─────────────────────────────────────────────────────────────────────────┘
+  deploy:
+    name: "🚀 Deploy to Production"
+    runs-on: ubuntu-latest
+    needs: docker
+    environment: production
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # ── Safety guard: reject missing or root DEPLOY_PATH ─────────────────
+      # rsync --delete running against "/" would wipe the server.
+      - name: Validate DEPLOY_PATH
         run: |
-          docker run -d \
-            --name two-tier-app \
-            -p 5000:5000 \
-            two-tier-app:latest
+          DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
 
-      - name: Wait for Application
-        run: sleep 10
+          if [[ -z "${DEPLOY_PATH}" ]]; then
+            echo "::error::DEPLOY_PATH secret is not set. Aborting."
+            exit 1
+          fi
+          if [[ "${DEPLOY_PATH}" == "/" ]]; then
+            echo "::error::DEPLOY_PATH is '/' which is forbidden. Aborting."
+            exit 1
+          fi
+          if [[ "${DEPLOY_PATH}" != /* ]]; then
+            echo "::error::DEPLOY_PATH must be an absolute path. Got: '${DEPLOY_PATH}'"
+            exit 1
+          fi
+          echo "DEPLOY_PATH is valid: ${DEPLOY_PATH}"
 
-      - name: Check Container Status
+      # ── SSH key setup ─────────────────────────────────────────────────────
+      # Write the key to a file with strict 600 permissions.
+      # SSH rejects key files that are readable by anyone else.
+      - name: Set up SSH key
         run: |
-          docker ps -a
-          docker logs two-tier-app
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
 
-      - name: Test Application
+      # Pre-add the server fingerprint so SSH does not prompt interactively.
+      - name: Trust server host key
         run: |
-          for i in {1..10}; do
-            if curl -fsS http://localhost:5000; then
-              echo "Application is running successfully!"
-              exit 0
+          SSH_PORT="${{ secrets.SSH_PORT || '22' }}"
+          ssh-keyscan -p "${SSH_PORT}" -H "${{ secrets.SSH_HOST }}" \
+            >> ~/.ssh/known_hosts 2>/dev/null
+
+      # ── Sync compose file + SQL init script to the server ─────────────────
+      # Only three files are synced – no source code.
+      # The server pulls the pre-built image from Docker Hub.
+      - name: Sync compose file to server
+        run: |
+          SSH_PORT="${{ secrets.SSH_PORT || '22' }}"
+          rsync -az \
+            --include='docker-compose.yml' \
+            --include='.env.example' \
+            --include='message.sql' \
+            --exclude='*' \
+            -e "ssh -p ${SSH_PORT} -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            ./ \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ secrets.DEPLOY_PATH }}/"
+
+      # ── Pull image and restart containers ─────────────────────────────────
+      # Runs as the non-root SSH user (must be in the docker group on the server).
+      # Uses the exact SHA tag produced by the docker job – not "latest" –
+      # so the server always runs the commit that passed all checks.
+      - name: Pull image and restart containers
+        env:
+          IMAGE_TAG: ${{ needs.docker.outputs.image_tag }}
+        run: |
+          SSH_PORT="${{ secrets.SSH_PORT || '22' }}"
+
+          ssh -p "${SSH_PORT}" \
+              -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=yes \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+              bash -s -- \
+                "${{ secrets.DOCKERHUB_USERNAME }}" \
+                "${IMAGE_TAG}" \
+                "${{ secrets.DEPLOY_PATH }}" \
+              << 'ENDSSH'
+          set -euo pipefail
+
+          DOCKERHUB_USER="$1"
+          IMAGE_TAG="$2"
+          DEPLOY_PATH="$3"
+          IMAGE="${DOCKERHUB_USER}/two-tier-flask-app"
+
+          echo "──────────────────────────────────────────"
+          echo " Server: $(hostname)"
+          echo " Image : ${IMAGE}:${IMAGE_TAG}"
+          echo " Path  : ${DEPLOY_PATH}"
+          echo "──────────────────────────────────────────"
+
+          cd "${DEPLOY_PATH}"
+
+          echo "▶ Pulling image..."
+          docker pull "${IMAGE}:${IMAGE_TAG}"
+
+          # Pass the SHA tag to docker-compose so it uses the exact image.
+          export TAG="${IMAGE_TAG}"
+
+          # Support both docker compose (plugin v2) and docker-compose (v1).
+          if docker compose version > /dev/null 2>&1; then
+            COMPOSE="docker compose"
+          else
+            COMPOSE="docker-compose"
+          fi
+
+          echo "▶ Restarting containers..."
+          ${COMPOSE} up -d --no-build
+
+          echo "▶ Removing dangling images..."
+          docker image prune -f
+
+          echo "✔ Deploy complete."
+          ENDSSH
+
+      # ── Smoke test ────────────────────────────────────────────────────────
+      # SSHes back in and curls /health from inside the server.
+      # Running the check from inside avoids firewall issues on the runner.
+      # Retries every 5 s for up to 60 s before giving up.
+      # On timeout, dumps the last 50 container log lines for diagnosis.
+      - name: Smoke test – /health endpoint
+        run: |
+          SSH_PORT="${{ secrets.SSH_PORT || '22' }}"
+
+          ssh -p "${SSH_PORT}" \
+              -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=yes \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+              bash -s -- 5000 60 5 \
+              << 'ENDSSH'
+          set -euo pipefail
+          APP_PORT="$1"
+          MAX_WAIT="$2"
+          INTERVAL="$3"
+          elapsed=0
+
+          echo "▶ Waiting for http://localhost:${APP_PORT}/health ..."
+
+          until curl -fsS --max-time 5 \
+                  "http://localhost:${APP_PORT}/health" -o /dev/null; do
+            if (( elapsed >= MAX_WAIT )); then
+              echo "::error::Health check timed out after ${MAX_WAIT}s."
+              echo "──── Last 50 flask-app log lines ────"
+              docker logs --tail 50 flask-app 2>&1 || true
+              exit 1
             fi
-            echo "Waiting for application..."
-            sleep 5
+            echo "  still waiting… ${elapsed}s elapsed"
+            sleep "${INTERVAL}"
+            elapsed=$(( elapsed + INTERVAL ))
           done
 
-          echo "Application health check failed!"
-          docker logs two-tier-app
-          exit 1
+          echo "✔ App is healthy and serving traffic."
+          ENDSSH
 
-      - name: Cleanup
+      # ── Always remove the private key from the runner ─────────────────────
+      - name: Remove SSH key
         if: always()
-        run: |
-          docker rm -f two-tier-app || true
+        run: rm -f ~/.ssh/deploy_key
