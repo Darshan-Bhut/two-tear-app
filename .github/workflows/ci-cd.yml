@@ -33,6 +33,8 @@ on:
 # Minimal permissions – only read repository content.
 permissions:
   contents: read
+  packages: write
+  security-events: write
 
 # If a new commit is pushed while a run is in progress for the same branch,
 # cancel the old run and start fresh.
